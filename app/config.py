@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logger = logging.getLogger("app.config")
 
 class Settings(BaseModel):
@@ -16,7 +15,8 @@ class Settings(BaseModel):
 def get_settings() -> Settings:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     secret = os.environ.get("WEBHOOK_SECRET_TOKEN")
-    # Prefer explicit PUBLIC_BASE_URL; otherwise use Render’s RENDER_EXTERNAL_URL
+
+    # Render sets RENDER_EXTERNAL_URL automatically
     public = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
 
     if not token:
@@ -24,10 +24,11 @@ def get_settings() -> Settings:
     if not secret:
         raise RuntimeError("WEBHOOK_SECRET_TOKEN not set")
 
-    s = Settings(
+    settings = Settings(
         TELEGRAM_BOT_TOKEN=token,
         WEBHOOK_SECRET_TOKEN=secret,
         PUBLIC_BASE_URL=public,
     )
-    logger.info("Settings loaded. PUBLIC_BASE_URL=%s", s.PUBLIC_BASE_URL)
-    return s
+
+    logger.info("Settings loaded. PUBLIC_BASE_URL=%s", settings.PUBLIC_BASE_URL)
+    return settings
