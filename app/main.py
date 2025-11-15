@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import shutil
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -46,7 +47,10 @@ class Out(BaseModel):
 
 # ---------------------- YouTube Helpers ----------------------
 def download_video(url: str) -> str:
-    """Downloads a video and returns local file path."""
+    """
+    Downloads a video to a new temp directory and returns the full local file path.
+    Temp directory lives under the OS temp dir (e.g. %TEMP% on Windows, /tmp on Linux/Mac).
+    """
     tmpdir = tempfile.mkdtemp(prefix="yt_simple_")
     outtmpl = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
@@ -59,9 +63,9 @@ def download_video(url: str) -> str:
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
+        filename = ydl.prepare_filename(info)  # full path to downloaded file
 
-    return filename
+    return filename  # e.g. C:\Users\...\AppData\Local\Temp\yt_simple_xxx\My Video.mp4
 
 
 def build_youtube_client():
@@ -76,12 +80,15 @@ def build_youtube_client():
     return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 
-def upload_to_youtube(video_path: str) -> str:
+def upload_to_youtube(video_path: str, title: str | None = None, description: str | None = None, privacy: str = "private") -> str:
     youtube = build_youtube_client()
 
     body = {
-        "snippet": {"title": "Uploaded via Bot", "description": "Auto-uploaded video"},
-        "status": {"privacyStatus": "private"},
+        "snippet": {
+            "title": title or "Uploaded via Bot",
+            "description": description or "Auto-uploaded video",
+        },
+        "status": {"privacyStatus": privacy},
     }
 
     media = MediaFileUpload(video_path, chunksize=1024 * 1024, resumable=True)
@@ -119,10 +126,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             path = download_video(url)
             vid = upload_to_youtube(path)
             link = f"https://youtu.be/{vid}"
-
             await msg.reply_text(f"✅ Uploaded successfully!\n{link}")
         except Exception as e:
             await msg.reply_text(f"❌ Error: {str(e)}")
+        finally:
+            # cleanup temp dir/file
+            try:
+                if path:
+                    tmpdir = os.path.dirname(path)
+                    if os.path.exists(tmpdir):
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
 
         return
 
@@ -164,7 +179,64 @@ async def healthz():
 
 @app.post("/process", response_model=Out)
 async def process_endpoint(inp: In):
+    """
+    Existing simple text endpoint: echoes with 'bhola ' prefix.
+    """
     return Out(result=process_text(inp.text))
+
+@app.post("/url-upload")
+async def url_upload_endpoint(payload: dict):
+    """
+    NEW route: takes a URL, downloads the video to a temp folder, uploads to YouTube,
+    cleans up the temp files, and returns the YouTube video id + link.
+
+    Body (application/json):
+      {
+        "url": "https://...required...",
+        "title": "optional title",
+        "description": "optional description",
+        "privacy": "private|unlisted|public"   (optional; default 'private')
+      }
+    """
+    url = (payload or {}).get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url' in body")
+
+    title = (payload or {}).get("title")
+    description = (payload or {}).get("description")
+    privacy = (payload or {}).get("privacy") or "private"
+
+    # Validate required YouTube env vars
+    missing = [k for k in ("YT_CLIENT_ID", "YT_CLIENT_SECRET", "YT_REFRESH_TOKEN") if not os.getenv(k)]
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Missing env vars: {', '.join(missing)}")
+
+    local_path = None
+    try:
+        # 1) download
+        local_path = download_video(url)
+        print("Downloaded to:", local_path)
+
+        # 2) upload
+        video_id = upload_to_youtube(local_path, title=title, description=description, privacy=privacy)
+        link = f"https://youtu.be/{video_id}"
+
+        return {"ok": True, "video_id": video_id, "link": link}
+
+    except Exception as e:
+        # common Google OAuth errors bubble up here too
+        # e.g. 'invalid_grant' (expired/revoked) or 'unauthorized_client'
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    finally:
+        # 3) cleanup temp dir/file
+        try:
+            if local_path:
+                tmpdir = os.path.dirname(local_path)
+                if os.path.exists(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
